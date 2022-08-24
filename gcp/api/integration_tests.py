@@ -98,18 +98,33 @@ class IntegrationTests(unittest.TestCase):
     self.assertDictEqual(expected, actual)
 
   def assert_results_equal(self, expected, actual):
+    """Assert that results are equal.
+
+    Args:
+      expected: dictionary representation of the expected vulnerability.
+      actual: dictionary representation of the actual vulnerability.
+    """
+    # Single query results.
     for vuln in expected.get('vulns', []):
       self.remove_modified(vuln)
 
     for vuln in actual.get('vulns', []):
       self.remove_modified(vuln)
 
+    # Batch query results.
+    for batch_result in actual.get('results', []):
+      for vuln in batch_result.get('vulns', {}):
+        # Ensure that batch queries include the timestamp.
+        self.remove_modified(vuln, check_exists=True)
+
     self.assertDictEqual(expected, actual)
 
-  def remove_modified(self, vuln):
+  def remove_modified(self, vuln, check_exists=False):
     """Remove lastModified for comparison."""
     if 'modified' in vuln:
       del vuln['modified']
+    elif check_exists:
+      raise ValueError('Missing modified timestamp')
 
   def test_get(self):
     """Test getting a vulnerability."""
@@ -153,6 +168,56 @@ class IntegrationTests(unittest.TestCase):
             }
         }))
     self.assert_results_equal({'vulns': [self._VULN_744]}, response.json())
+
+  def test_query_debian(self):
+    """Test querying Debian with sub ecosystem versions"""
+    dsa_2665_1 = self._get('DSA-710-1')
+
+    response = requests.post(
+        _api() + '/v1/query',
+        data=json.dumps({
+            'version': '1.0.2-1',
+            'package': {
+                'name': 'gtkhtml',
+                'ecosystem': 'Debian',
+            }
+        }))
+    self.assert_results_equal({'vulns': [dsa_2665_1]}, response.json())
+
+    response = requests.post(
+        _api() + '/v1/query',
+        data=json.dumps({
+            'version': '1.0.2-1',
+            'package': {
+                'name': 'gtkhtml',
+                'ecosystem': 'Debian:3.0',
+            }
+        }))
+    self.assert_results_equal({'vulns': [dsa_2665_1]}, response.json())
+
+    # The vulnerbility does not exist in 4.0 release, so this should return
+    # with nothing
+    response = requests.post(
+        _api() + '/v1/query',
+        data=json.dumps({
+            'version': '1.0.2-1',
+            'package': {
+                'name': 'gtkhtml',
+                'ecosystem': 'Debian:4.0',
+            }
+        }))
+    self.assert_results_equal({}, response.json())
+
+    response = requests.post(
+        _api() + '/v1/query',
+        data=json.dumps({
+            'version': '1.0.2-1',
+            'package': {
+                'name': 'gtkhtml',
+                'ecosystem': 'Debian:9',
+            }
+        }))
+    self.assert_results_equal({}, response.json())
 
   def test_query_semver(self):
     """Test query by SemVer."""
@@ -242,7 +307,10 @@ class IntegrationTests(unittest.TestCase):
 
   def test_query_purl(self):
     """Test querying by PURL."""
-    expected = self._get('GHSA-qc84-gqf4-9926')
+    expected = [
+        self._get('GHSA-qc84-gqf4-9926'),
+        self._get('RUSTSEC-2022-0041')
+    ]
 
     response = requests.post(
         _api() + '/v1/query',
@@ -253,7 +321,7 @@ class IntegrationTests(unittest.TestCase):
             }
         }))
 
-    self.assert_results_equal({'vulns': [expected]}, response.json())
+    self.assert_results_equal({'vulns': expected}, response.json())
 
     response = requests.post(
         _api() + '/v1/query',
@@ -262,7 +330,148 @@ class IntegrationTests(unittest.TestCase):
                 'purl': 'pkg:cargo/crossbeam-utils@0.8.6',
             }}))
 
-    self.assert_results_equal({'vulns': [expected]}, response.json())
+    self.assert_results_equal({'vulns': expected}, response.json())
+
+    expected_deb = [self._get('DSA-4921-1')]
+
+    response = requests.post(
+        _api() + '/v1/query',
+        data=json.dumps(
+            {'package': {
+                'purl': 'pkg:deb/debian/nginx@1.14.2-2+deb10u3',
+            }}))
+
+    self.assert_results_equal({'vulns': expected_deb}, response.json())
+
+    # Source arch should return the same as above
+    response = requests.post(
+        _api() + '/v1/query',
+        data=json.dumps({
+            'package': {
+                'purl': 'pkg:deb/debian/nginx@1.14.2-2+deb10u3?arch=source',
+            }
+        }))
+
+    self.assert_results_equal({'vulns': expected_deb}, response.json())
+
+    # A non source arch should return nothing, as we don't index them
+    response = requests.post(
+        _api() + '/v1/query',
+        data=json.dumps({
+            'package': {
+                'purl': 'pkg:deb/debian/nginx@1.14.2-2+deb10u3?arch=x64',
+            }
+        }))
+
+    self.assert_results_equal({}, response.json())
+
+    # A non arch qualifier should be ignored
+    response = requests.post(
+        _api() + '/v1/query',
+        data=json.dumps({
+            'package': {
+                'purl': ('pkg:deb/debian/nginx@1.14.2-2+deb10u3?'
+                         'randomqualifier=1234'),
+            }
+        }))
+
+    self.assert_results_equal({'vulns': expected_deb}, response.json())
+
+  def test_query_batch(self):
+    """Test batch query."""
+    response = requests.post(
+        _api() + '/v1/querybatch',
+        data=json.dumps({
+            'queries': [{
+                'version': '0.8.6',
+                'package': {
+                    'purl': 'pkg:cargo/crossbeam-utils',
+                }
+            }, {
+                'version': '2.4.0',
+                'package': {
+                    'name': 'gopkg.in/yaml.v2',
+                    'ecosystem': 'Go',
+                }
+            }, {
+                'commit': '233cb49903fa17637bd51f4a16b4ca61e0750f24',
+            }],
+        }))
+
+    self.assert_results_equal(
+        {
+            'results': [
+                {
+                    'vulns': [{
+                        'id': 'GHSA-qc84-gqf4-9926',
+                    }, {
+                        'id': 'RUSTSEC-2022-0041',
+                    }]
+                },
+                {},
+                {
+                    'vulns': [{
+                        'id': 'OSV-2020-744',
+                    }]
+                },
+            ]
+        }, response.json())
+
+  def test_query_package(self):
+    """Test query by package."""
+    response = requests.post(
+        _api() + '/v1/query',
+        data=json.dumps({
+            'package': {
+                'ecosystem': 'Maven',
+                'name': 'org.apache.tomcat:tomcat',
+            }
+        }))
+
+    result = response.json()
+    vulns_first = set(v['id'] for v in result['vulns'])
+    self.assertIn('next_page_token', result)
+
+    response = requests.post(
+        _api() + '/v1/query',
+        data=json.dumps({
+            'package': {
+                'ecosystem': 'Maven',
+                'name': 'org.apache.tomcat:tomcat',
+            },
+            'page_token': result['next_page_token'],
+        }))
+
+    result = response.json()
+    vulns_second = set(v['id'] for v in result['vulns'])
+
+    self.assertEqual(set(), vulns_first.intersection(vulns_second))
+
+  def test_query_package_purl(self):
+    """Test query by package (purl)."""
+    response = requests.post(
+        _api() + '/v1/query',
+        data=json.dumps(
+            {'package': {
+                'purl': 'pkg:maven/org.apache.tomcat/tomcat',
+            }}))
+    result = response.json()
+    vulns_first = set(v['id'] for v in result['vulns'])
+    self.assertIn('next_page_token', result)
+
+    response = requests.post(
+        _api() + '/v1/query',
+        data=json.dumps({
+            'package': {
+                'purl': 'pkg:maven/org.apache.tomcat/tomcat',
+            },
+            'page_token': result['next_page_token'],
+        }))
+
+    result = response.json()
+    vulns_second = set(v['id'] for v in result['vulns'])
+
+    self.assertEqual(set(), vulns_first.intersection(vulns_second))
 
 
 def print_logs(filename):
@@ -292,6 +501,3 @@ if __name__ == '__main__':
     unittest.main()
   finally:
     server.stop()
-
-    print_logs('esp.log')
-    print_logs('backend.log')

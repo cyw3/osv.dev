@@ -13,6 +13,7 @@
 # limitations under the License.
 """Handlers for the OSV web frontend."""
 
+import json
 import os
 import math
 
@@ -22,7 +23,9 @@ from flask import make_response
 from flask import redirect
 from flask import render_template
 from flask import request
+from flask import url_for
 import markdown2
+from urllib import parse
 
 import cache
 import osv
@@ -35,6 +38,7 @@ blueprint = Blueprint('frontend_handlers', __name__)
 _PAGE_SIZE = 16
 _PAGE_LOOKAHEAD = 4
 _REQUESTS_PER_MIN = 30
+_MAX_LINKING_ALIASES = 8
 
 if utils.is_prod():
   redis_host = os.environ.get('REDISHOST', 'localhost')
@@ -82,7 +86,7 @@ def index_v2_with_subpath(subpath):
 @blueprint.route('/')
 def index():
   return render_template(
-      'home.html', ecosystem_counts=osv_get_ecosystem_counts())
+      'home.html', ecosystem_counts=osv_get_ecosystem_counts_cached())
 
 
 @blueprint.route('/about')
@@ -93,6 +97,16 @@ def about():
 @blueprint.route('/list')
 def list_vulnerabilities():
   """Main page."""
+  is_turbo_frame = request.headers.get('Turbo-Frame')
+
+  # Remove page parameter if not from turbo frame
+  if not is_turbo_frame:
+    if request.args.get('page', 1) != 1:
+      q = parse.parse_qs(request.query_string)
+      q.pop(b'page', None)
+      return redirect(
+          url_for(request.endpoint) + '?' + parse.urlencode(q, True))
+
   query = request.args.get('q', '')
   page = int(request.args.get('page', 1))
   ecosystem = request.args.get('ecosystem')
@@ -100,12 +114,13 @@ def list_vulnerabilities():
 
   # Fetch ecosystems by default. As an optimization, skip when rendering page
   # fragments.
-  ecosystem_counts = osv_get_ecosystem_counts(
-  ) if not request.headers.get('Turbo-Frame') else None
+  ecosystem_counts = osv_get_ecosystem_counts_cached(
+  ) if not is_turbo_frame else None
 
   return render_template(
       'list.html',
       page=page,
+      total_pages=math.ceil(results['total'] / _PAGE_SIZE),
       query=query,
       selected_ecosystem=ecosystem,
       ecosystem_counts=ecosystem_counts,
@@ -130,6 +145,7 @@ def bug_to_response(bug, detailed=True):
   if detailed:
     add_links(response)
     add_source_info(bug, response)
+    add_related_aliases(bug, response)
   return response
 
 
@@ -176,6 +192,40 @@ def add_source_info(bug, response):
   response['source_link'] = response['source']
 
 
+def add_related_aliases(bug: osv.Bug, response):
+  """Add links to other osv entries that's related through aliases"""
+  # Add links to other entries if they exist
+  aliases = {}
+  for alias in bug.aliases:
+    # only if there aren't too many, otherwise skip this
+    if len(bug.aliases) <= _MAX_LINKING_ALIASES:
+      result = bug.get_by_id(alias)
+    else:
+      result = False
+    aliases[alias] = {'exists': result, 'same_alias_entries': []}
+
+  # Add links to other entries that have the same alias or references this
+  if bug.aliases:
+    query = osv.Bug.query(osv.Bug.aliases.IN(bug.aliases + [bug.id()]))
+    for other in query:
+      if other.id() == bug.id():
+        continue
+      for other_alias in other.aliases:
+        if other_alias in aliases:
+          aliases[other_alias]['same_alias_entries'].append(other.id())
+      if bug.id() in other.aliases:
+        aliases[other.id()] = {'exists': True, 'same_alias_entries': []}
+
+  # Remove self if it was added
+  aliases.pop(bug.id(), None)
+
+  response['aliases'] = [{
+      'alias_id': aid,
+      'exists': ex['exists'],
+      'same_alias_entries': ex['same_alias_entries']
+  } for aid, ex in aliases.items()]
+
+
 def _commit_to_link(repo_url, commit):
   """Convert commit to link."""
   vcs = source_mapper.get_vcs_viewer_for_url(repo_url)
@@ -203,14 +253,28 @@ def osv_get_ecosystems():
                 key=str.lower)
 
 
+# TODO: Figure out how to skip cache when testing
 @cache.instance.cached(
     timeout=24 * 60 * 60, key_prefix='osv_get_ecosystem_counts')
+def osv_get_ecosystem_counts_cached():
+  """Get count of vulnerabilities per ecosystem, cached"""
+  return osv_get_ecosystem_counts()
+
+
 def osv_get_ecosystem_counts():
   """Get count of vulnerabilities per ecosystem."""
   counts = {}
   ecosystems = osv_get_ecosystems()
   for ecosystem in ecosystems:
-    counts[ecosystem] = osv.Bug.query(osv.Bug.ecosystem == ecosystem).count()
+    if ':' in ecosystem:
+      # Count by the base ecosystem index. Otherwise we'll overcount as a
+      # single entry may refer to multiple sub-ecosystems.
+      continue
+
+    counts[ecosystem] = osv.Bug.query(
+        osv.Bug.ecosystem == ecosystem,
+        osv.Bug.public == True,  # pylint: disable=singleton-comparison
+        osv.Bug.status == osv.BugStatus.PROCESSED).count()
 
   return counts
 
@@ -315,7 +379,7 @@ def event_value(event):
 def should_collapse(affected):
   """Whether if we should collapse the package tab bar."""
   total_package_length = sum(
-      [len(entry.get('package', {}).get('name', '')) for entry in affected])
+      len(entry.get('package', {}).get('name', '')) for entry in affected)
   return total_package_length > 70 or len(affected) > 5
 
 
@@ -342,6 +406,15 @@ def markdown(text):
     return markdown2.markdown(text, extras=['fenced-code-blocks'])
 
   return ''
+
+
+@blueprint.app_template_filter('display_json')
+def display_json(data):
+  # We can't use the default `tojson` filter as it's intended for code (and
+  # escapes characters like '<' to '\u003c'). We want to render the JSON for
+  # display purposes and use HTML escaping ('&lt;') instead so it's rendered
+  # as '<'.
+  return json.dumps(data, indent=4)
 
 
 @blueprint.app_template_filter('log')

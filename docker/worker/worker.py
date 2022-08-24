@@ -19,6 +19,8 @@ import json
 import logging
 import os
 import math
+import re
+import redis
 import resource
 import shutil
 import subprocess
@@ -35,6 +37,7 @@ from google.cloud import storage
 sys.path.append(os.path.dirname(os.path.realpath(__file__)))
 import osv
 import osv.ecosystems
+import osv.cache
 from osv import vulnerability_pb2
 import oss_fuzz
 
@@ -55,7 +58,30 @@ REPO_DENYLIST = {
     'https://github.com/google/AFL.git',
 }
 
+_ECOSYSTEM_PUSH_TOPICS = {
+    'PyPI': 'projects/oss-vdb/topics/pypi-bridge',
+}
+
 _state = threading.local()
+
+
+class RedisCache(osv.cache.Cache):
+  """Redis cache implementation."""
+
+  redis_instance: redis.client.Redis
+
+  def __init__(self, host, port):
+    self.redis_instance = redis.Redis(host, port)
+
+  def get(self, key):
+    try:
+      return json.loads(self.redis_instance.get(json.dumps(key)))
+    except Exception:
+      # TODO(ochang): Remove this after old cache entries are flushed.
+      return None
+
+  def set(self, key, value, ttl):
+    return self.redis_instance.set(json.dumps(key), json.dumps(value), ex=ttl)
 
 
 class UpdateConflictError(Exception):
@@ -231,8 +257,14 @@ def add_fix_information(vulnerability, fix_result):
 
 # TODO(ochang): Remove this function once GHSA's encoding is fixed.
 def fix_invalid_ghsa(vulnerability):
-  """Attempt to fix an invalid GHSA entry and returns whether the GHSA
-  entry is valid."""
+  """Attempt to fix an invalid GHSA entry.
+
+  Args:
+    vulnerability: a vulnerability object.
+
+  Returns:
+    whether the GHSA entry is valid.
+  """
   packages = {}
   for affected in vulnerability.affected:
     details = packages.setdefault(
@@ -272,6 +304,17 @@ def fix_invalid_ghsa(vulnerability):
       return False
 
   return True
+
+
+def maybe_normalize_package_names(vulnerability):
+  """Normalize package names as necessary."""
+  for affected in vulnerability.affected:
+    if affected.package.ecosystem == 'PyPI':
+      # per https://peps.python.org/pep-0503/#normalized-names
+      affected.package.name = re.sub(r'[-_.]+', '-',
+                                     affected.package.name).lower()
+
+  return vulnerability
 
 
 class TaskRunner:
@@ -429,10 +472,12 @@ class TaskRunner:
                  original_sha256):
     """Process updates on a vulnerability."""
     logging.info('Processing update for vulnerability %s', vulnerability.id)
+    vulnerability = maybe_normalize_package_names(vulnerability)
     if source_repo.name == 'ghsa' and not fix_invalid_ghsa(vulnerability):
       logging.warning('%s has an encoding error, skipping.', vulnerability.id)
       return
 
+    orig_modified_date = vulnerability.modified.ToDatetime()
     try:
       result = self._analyze_vulnerability(source_repo, repo, vulnerability,
                                            relative_path, original_sha256)
@@ -455,6 +500,7 @@ class TaskRunner:
 
     bug.update_from_vulnerability(vulnerability)
     bug.public = True
+    bug.import_last_modified = orig_modified_date
 
     # OSS-Fuzz sourced bugs use a different format for source_id.
     if source_repo.name != 'oss-fuzz' or not bug.source_id:
@@ -467,6 +513,23 @@ class TaskRunner:
 
     bug.put()
     osv.update_affected_commits(bug.key.id(), result.commits, bug.public)
+    self._notify_ecosystem_bridge(vulnerability)
+
+  def _notify_ecosystem_bridge(self, vulnerability):
+    """Notify ecosystem bridges."""
+    ecosystems = set()
+    for affected in vulnerability.affected:
+      if affected.package.ecosystem in ecosystems:
+        continue
+
+      ecosystems.add(affected.package.ecosystem)
+      ecosystem_push_topic = _ECOSYSTEM_PUSH_TOPICS.get(
+          affected.package.ecosystem)
+      if ecosystem_push_topic:
+        publisher = pubsub_v1.PublisherClient()
+        publisher.publish(
+            ecosystem_push_topic,
+            data=json.dumps(osv.vulnerability_to_dict(vulnerability)).encode())
 
   def _do_process_task(self, subscriber, subscription, ack_id, message,
                        done_event):
@@ -573,11 +636,18 @@ def main():
   parser.add_argument('--deps_dev_api_key', help='deps.dev API key')
   parser.add_argument('--ssh_key_public', help='Public SSH key path')
   parser.add_argument('--ssh_key_private', help='Private SSH key path')
+  parser.add_argument(
+      '--redis_host', help='URL to redis instance, enables redis cache')
+  parser.add_argument(
+      '--redis_port', default=6379, help='Port of redis instance')
   args = parser.parse_args()
 
   if args.deps_dev_api_key:
     osv.ecosystems.use_deps_dev = True
     osv.ecosystems.deps_dev_api_key = args.deps_dev_api_key
+
+  if args.redis_host:
+    osv.ecosystems.set_cache(RedisCache(args.redis_host, args.redis_port))
 
   # Work around kernel bug: https://gvisor.dev/issue/1765
   resource.setrlimit(resource.RLIMIT_MEMLOCK,

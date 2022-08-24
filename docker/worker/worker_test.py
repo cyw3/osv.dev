@@ -585,6 +585,7 @@ class UpdateTest(unittest.TestCase, tests.ExpectationTest(TEST_DATA_DIR)):
         project=['blah.com/package'],
         ecosystem=['golang'],
         source_id='source:BLAH-123.yaml',
+        import_last_modified=datetime.datetime(2021, 1, 1, 0, 0),
         source_of_truth=osv.SourceOfTruth.SOURCE_REPO).put()
     osv.Bug(
         db_id='BLAH-124',
@@ -592,6 +593,7 @@ class UpdateTest(unittest.TestCase, tests.ExpectationTest(TEST_DATA_DIR)):
         project=['blah.com/package'],
         ecosystem=['golang'],
         source_id='source:BLAH-124.yaml',
+        import_last_modified=datetime.datetime(2021, 1, 1, 0, 0),
         source_of_truth=osv.SourceOfTruth.SOURCE_REPO).put()
     osv.Bug(
         db_id='BLAH-125',
@@ -600,13 +602,19 @@ class UpdateTest(unittest.TestCase, tests.ExpectationTest(TEST_DATA_DIR)):
         project=['blah.com/package'],
         ecosystem=['golang'],
         source_id='source:BLAH-125.yaml',
+        import_last_modified=datetime.datetime(2021, 1, 1, 0, 0),
         source_of_truth=osv.SourceOfTruth.SOURCE_REPO).put()
     osv.Bug(
         db_id='BLAH-127',
         project=['blah.com/package'],
         ecosystem=['golang'],
         source_id='source:BLAH-127.yaml',
+        import_last_modified=datetime.datetime(2021, 1, 1, 0, 0),
         source_of_truth=osv.SourceOfTruth.SOURCE_REPO).put()
+
+    mock_publish = mock.patch('google.cloud.pubsub_v1.PublisherClient.publish')
+    self.mock_publish = mock_publish.start()
+    self.addCleanup(mock_publish.stop)
 
   def tearDown(self):
     self.tmp_dir.cleanup()
@@ -643,6 +651,8 @@ class UpdateTest(unittest.TestCase, tests.ExpectationTest(TEST_DATA_DIR)):
         'febfac1940086bc1f6d3dc33fda0a1d1ba336209',
         'ff8cc32ba60ad9cbb3b23f0a82aad96ebe9ff76b',
     ], [commit.commit for commit in affected_commits])
+
+    self.mock_publish.assert_not_called()
 
   def test_update_limit(self):
     """Test basic update with limit events."""
@@ -919,6 +929,49 @@ class UpdateTest(unittest.TestCase, tests.ExpectationTest(TEST_DATA_DIR)):
         'eefe8ec3f1f90d0e684890e810f3f21e8500a4cd',
     ], [a.commit for a in affected_commits])
 
+    self.expect_equal('pypi_pubsub_calls', self.mock_publish.mock_calls)
+
+  def test_normalize_pypi(self):
+    """Test a PyPI entry normalizes as expected."""
+    self.source_repo.ignore_git = False
+    self.source_repo.versions_from_repo = False
+    self.source_repo.detect_cherrypicks = False
+    self.source_repo.put()
+
+    self.mock_repo.add_file(
+        'PYSEC-456.yaml',
+        self._load_test_data(os.path.join(TEST_DATA_DIR, 'PYSEC-456.yaml')))
+    self.mock_repo.commit('User', 'user@email')
+    task_runner = worker.TaskRunner(ndb_client, None, self.tmp_dir.name, None,
+                                    None)
+    message = mock.Mock()
+    message.attributes = {
+        'source': 'source',
+        'path': 'PYSEC-456.yaml',
+        'original_sha256': _sha256('PYSEC-456.yaml'),
+        'deleted': 'false',
+    }
+    task_runner._source_update(message)
+
+    repo = pygit2.Repository(self.remote_source_repo_path)
+    commit = repo.head.peel()
+    diff = repo.diff(commit.parents[0], commit)
+
+    self.expect_equal('diff_normalized_pypi', diff.patch)
+
+    self.expect_dict_equal(
+        'normalized_pypi',
+        ndb.Key(osv.Bug, 'source:PYSEC-456').get()._to_dict())
+
+    affected_commits = list(osv.AffectedCommit.query())
+    self.assertCountEqual([
+        'b1c95a196f22d06fcf80df8c6691cd113d8fefff',
+        'eefe8ec3f1f90d0e684890e810f3f21e8500a4cd',
+    ], [a.commit for a in affected_commits])
+
+    self.expect_equal('normalized_pypi_pubsub_calls',
+                      self.mock_publish.mock_calls)
+
   def test_update_maven(self):
     """Test updating maven."""
     self.source_repo.ignore_git = False
@@ -955,6 +1008,8 @@ class UpdateTest(unittest.TestCase, tests.ExpectationTest(TEST_DATA_DIR)):
         'update_maven',
         ndb.Key(osv.Bug, 'source:GHSA-838r-hvwh-24h8').get()._to_dict())
 
+    self.mock_publish.assert_not_called()
+
   def test_update_bucket(self):
     """Test bucket entries."""
     self.source_repo.type = osv.SourceRepositoryType.BUCKET
@@ -979,6 +1034,44 @@ class UpdateTest(unittest.TestCase, tests.ExpectationTest(TEST_DATA_DIR)):
                            osv.Bug.get_by_id('GO-2021-0085')._to_dict())
     self.expect_dict_equal('update_bucket_1',
                            osv.Bug.get_by_id('GO-2021-0087')._to_dict())
+
+  def test_update_debian(self):
+    """Test updating debian."""
+    self.source_repo.ignore_git = False
+    self.source_repo.versions_from_repo = False
+    self.source_repo.detect_cherrypicks = False
+    self.source_repo.put()
+
+    self.mock_repo.add_file(
+        'DSA-3029-1.json',
+        self._load_test_data(os.path.join(TEST_DATA_DIR, 'DSA-3029-1.json')))
+    self.mock_repo.commit('User', 'user@email')
+    task_runner = worker.TaskRunner(ndb_client, None, self.tmp_dir.name, None,
+                                    None)
+    message = mock.Mock()
+    message.attributes = {
+        'source': 'source',
+        'path': 'DSA-3029-1.json',
+        'original_sha256': _sha256('DSA-3029-1.json'),
+        'deleted': 'false',
+    }
+    task_runner._source_update(message)
+
+    repo = pygit2.Repository(self.remote_source_repo_path)
+    commit = repo.head.peel()
+
+    self.assertEqual('infra@osv.dev', commit.author.email)
+    self.assertEqual('OSV', commit.author.name)
+    self.assertEqual('Update DSA-3029-1', commit.message)
+    diff = repo.diff(commit.parents[0], commit)
+
+    self.expect_equal('diff_debian', diff.patch)
+
+    self.expect_dict_equal(
+        'update_debian',
+        ndb.Key(osv.Bug, 'source:DSA-3029-1').get()._to_dict())
+
+    self.mock_publish.assert_not_called()
 
   def test_update_android(self):
     """Test updating Android through bucket entries."""

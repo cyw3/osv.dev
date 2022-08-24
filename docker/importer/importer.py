@@ -37,10 +37,6 @@ _OSS_FUZZ_EXPORT_BUCKET = 'oss-fuzz-osv-vulns'
 _EXPORT_WORKERS = 32
 _NO_UPDATE_MARKER = 'OSV-NO-UPDATE'
 
-_ECOSYSTEM_PUSH_TOPICS = {
-    'PyPI': 'projects/oss-vdb/topics/pypi-bridge',
-}
-
 
 def _is_vulnerability_file(source_repo, file_path):
   """Return whether or not the file is a Vulnerability entry."""
@@ -99,8 +95,7 @@ class Importer:
                                  source_repo,
                                  original_sha256,
                                  path,
-                                 deleted=False,
-                                 vulnerability=None):
+                                 deleted=False):
     """Request analysis."""
     self._publisher.publish(
         _TASKS_TOPIC,
@@ -110,22 +105,6 @@ class Importer:
         path=path,
         original_sha256=original_sha256,
         deleted=str(deleted).lower())
-
-    if not vulnerability:
-      return
-
-    ecosystems = set()
-    for affected in vulnerability.affected:
-      if affected.package.ecosystem in ecosystems:
-        continue
-
-      ecosystems.add(affected.package.ecosystem)
-      ecosystem_push_topic = _ECOSYSTEM_PUSH_TOPICS.get(
-          affected.package.ecosystem)
-      if ecosystem_push_topic:
-        self._publisher.publish(
-            ecosystem_push_topic,
-            data=json.dumps(osv.vulnerability_to_dict(vulnerability)).encode())
 
   def _request_internal_analysis(self, bug):
     """Request internal analysis."""
@@ -223,17 +202,26 @@ class Importer:
     source_repo.last_update_date = utcnow().date()
     source_repo.put()
 
-  def _process_updates_git(self, source_repo):
-    """Process updates for a git source_repo."""
-    repo = self.checkout(source_repo)
+  def _sync_from_previous_commit(self, source_repo, repo):
+    """Sync the repository from the previous commit.
 
-    walker = repo.walk(repo.head.target, pygit2.GIT_SORT_TOPOLOGICAL)
-    if source_repo.last_synced_hash:
-      walker.hide(source_repo.last_synced_hash)
+    This was refactored out of _process_updates_git() due to excessive
+    indentation.
 
-    # Get list of changed files since last sync.
+    Args:
+      source_repo: the Git source repository.
+      repo: the checked out Git source repository.
+
+    Returns:
+      changed_entries: the set of repository paths that have changed.
+      deleted_entries: the set of repository paths that have been deleted.
+    """
     changed_entries = set()
     deleted_entries = set()
+
+    walker = repo.walk(repo.head.target, pygit2.GIT_SORT_TOPOLOGICAL)
+    walker.hide(source_repo.last_synced_hash)
+
     for commit in walker:
       if commit.author.email == osv.AUTHOR_EMAIL:
         continue
@@ -260,6 +248,31 @@ class Importer:
                                                        delta.new_file.path):
             changed_entries.add(delta.new_file.path)
 
+    return changed_entries, deleted_entries
+
+  def _process_updates_git(self, source_repo):
+    """Process updates for a git source_repo."""
+    repo = self.checkout(source_repo)
+
+    # Get list of changed files since last sync.
+    changed_entries = set()
+    deleted_entries = set()
+
+    if source_repo.last_synced_hash:
+      # Syncing from a previous commit.
+      changed_entries, deleted_entries = self._sync_from_previous_commit(
+          source_repo, repo)
+
+    else:
+      # First sync from scratch.
+      logging.info('Syncing repo from scratch')
+      for root, _, filenames in os.walk(osv.repo_path(repo)):
+        for filename in filenames:
+          path = os.path.join(root, filename)
+          rel_path = os.path.relpath(path, osv.repo_path(repo))
+          if _is_vulnerability_file(source_repo, rel_path):
+            changed_entries.add(rel_path)
+
     # Create tasks for changed files.
     for changed_entry in changed_entries:
       path = os.path.join(osv.repo_path(repo), changed_entry)
@@ -268,19 +281,15 @@ class Importer:
         continue
 
       try:
-        vulnerability = osv.parse_vulnerability(
-            path, key_path=source_repo.key_path)
+        _ = osv.parse_vulnerability(path, key_path=source_repo.key_path)
       except Exception as e:
         logging.error('Failed to parse %s: %s', changed_entry, str(e))
         continue
 
       logging.info('Re-analysis triggered for %s', changed_entry)
       original_sha256 = osv.sha256(path)
-      self._request_analysis_external(
-          source_repo,
-          original_sha256,
-          changed_entry,
-          vulnerability=vulnerability)
+      self._request_analysis_external(source_repo, original_sha256,
+                                      changed_entry)
 
     # Mark deleted entries as invalid.
     for deleted_entry in deleted_entries:
@@ -299,12 +308,14 @@ class Importer:
 
   def _process_updates_bucket(self, source_repo):
     """Process updates from bucket."""
-    if (source_repo.last_update_date and
-        source_repo.last_update_date >= utcnow().date()):
-      return
-
     # TODO(ochang): Use Pub/Sub change notifications for more efficient
     # processing.
+
+    ignore_last_import_time = source_repo.ignore_last_import_time
+    if ignore_last_import_time:
+      source_repo.ignore_last_import_time = False
+      source_repo.put()
+
     storage_client = storage.Client()
     for blob in storage_client.list_blobs(source_repo.bucket):
       if not _is_vulnerability_file(source_repo, blob.name):
@@ -312,7 +323,27 @@ class Importer:
 
       logging.info('Bucket entry triggered for for %s/%s', source_repo.bucket,
                    blob.name)
-      original_sha256 = osv.sha256_bytes(blob.download_as_bytes())
+      blob_bytes = blob.download_as_bytes()
+      try:
+        vulnerabilities = osv.parse_vulnerabilities_from_data(
+            blob_bytes,
+            os.path.splitext(blob.name)[1])
+      except Exception as e:
+        logging.error('Failed to parse vulnerability %s: %s', blob.name, e)
+        continue
+
+      def unchanged_vuln_exist(vuln):
+        bug = osv.Bug.get_by_id(vuln.id)
+        # Both times are not timezone aware
+        return bug and bug.import_last_modified == vuln.modified.ToDatetime()
+
+      if not ignore_last_import_time and all(
+          unchanged_vuln_exist(vuln) for vuln in vulnerabilities):
+        logging.info('Skipping updates for %s as modified date unchanged.',
+                     blob.name)
+        continue
+
+      original_sha256 = osv.sha256_bytes(blob_bytes)
       self._request_analysis_external(source_repo, original_sha256, blob.name)
 
     source_repo.last_update_date = utcnow().date()
