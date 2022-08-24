@@ -78,6 +78,7 @@ def get_monorail_service_account():
   return json.loads(response.payload.data.decode())
 
 
+# yalechen - api
 @blueprint.route(_CRON_ROUTE + '/make-bugs-public')
 def make_bugs_public():
   """Mark bugs public."""

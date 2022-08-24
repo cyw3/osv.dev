@@ -203,7 +203,7 @@ class Severity(ndb.Model):
   type = ndb.StringProperty()
   score = ndb.StringProperty()
 
-
+# yalechen - 模型 db表定义
 class Bug(ndb.Model):
   """Bug entity."""
   OSV_ID_PREFIX = 'OSV-'

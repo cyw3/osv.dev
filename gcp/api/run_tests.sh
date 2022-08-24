@@ -28,5 +28,6 @@ pip install -r requirements.txt
 service docker start
 
 export GOOGLE_CLOUD_PROJECT=oss-vdb
+# yalechen - 管理google云资源
 export GOOGLE_APPLICATION_CREDENTIALS="$1"
 python integration_tests.py "$1"

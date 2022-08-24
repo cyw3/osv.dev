@@ -93,6 +93,16 @@ consists of:
 
 - API server (`gcp/api`)
 - Web interface (`gcp/appengine`)
+```bash
+git submodule update --init --recursive
+pip install pipenv
+cd gcp/appengine/frontend3
+npm install
+cd ..
+pipenv install
+# pipenv shell
+./deploy.sh
+```
 - Workers for bisection and impact analysis (`docker/worker`)
 - Sample tools (`tools`)
 

@@ -48,7 +48,7 @@ if utils.is_prod():
     if not limiter.check_request(ip_addr):
       abort(429)
 
-
+# yalechen - api
 @blueprint.before_request
 def check_cors_preflight():
   """Handle CORS preflight requests."""
@@ -214,7 +214,7 @@ def osv_get_ecosystem_counts():
 
   return counts
 
-
+# yalechen - api
 def osv_query(search_string, page, affected_only, ecosystem):
   """Run an OSV query."""
   query = osv.Bug.query(osv.Bug.status == osv.BugStatus.PROCESSED,

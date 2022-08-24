@@ -59,7 +59,7 @@ _VULNERABILITYLIST = _descriptor.Descriptor(
   serialized_end=141,
 )
 
-
+# yalechen - api
 _QUERY = _descriptor.Descriptor(
   name='Query',
   full_name='osv.v1.Query',
