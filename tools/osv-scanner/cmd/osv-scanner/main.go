@@ -10,15 +10,16 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/google/osv.dev/tools/osv-scanner/internal/osv"
+	"github.com/google/osv.dev/tools/osv-scanner/internal/output"
+	"github.com/google/osv.dev/tools/osv-scanner/internal/sbom"
+
 	"github.com/g-rath/osv-detector/pkg/lockfile"
 	"github.com/urfave/cli/v2"
-
-	"github.com/google/osv.dev/tools/osv-scanner/internal/osv"
-	"github.com/google/osv.dev/tools/osv-scanner/internal/sbom"
 )
 
 // scanDir walks through the given directory to try to find any relevant files
-func scanDir(query *osv.BatchedQuery, dir string) error {
+func scanDir(query *osv.BatchedQuery, dir string, skipGit bool) error {
 	log.Printf("Scanning dir %s\n", dir)
 	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -26,23 +27,27 @@ func scanDir(query *osv.BatchedQuery, dir string) error {
 			return err
 		}
 
-		if info.IsDir() && info.Name() == ".git" {
+		if !skipGit && info.IsDir() && info.Name() == ".git" {
 			gitQuery, err := scanGit(filepath.Dir(path))
 			if err != nil {
 				log.Printf("scan failed for %s: %v\n", path, err)
 				return err
 			}
+			gitQuery.Source = "git:" + filepath.Dir(path)
 			query.Queries = append(query.Queries, gitQuery)
 		}
 
 		if !info.IsDir() {
 			if parser, _ := lockfile.FindParser(path, ""); parser != nil {
-				scanLockfile(query, path)
+				err := scanLockfile(query, path)
 				if err != nil {
 					log.Println("Attempted to scan lockfile but failed: " + path)
 				}
 			}
-			scanSBOMFile(query, path)
+			// No need to check for error
+			// If scan fails, it means it isn't a valid SBOM file,
+			// so just move onto the next file
+			_ = scanSBOMFile(query, path)
 		}
 
 		return nil
@@ -50,30 +55,38 @@ func scanDir(query *osv.BatchedQuery, dir string) error {
 }
 
 func scanLockfile(query *osv.BatchedQuery, path string) error {
-	log.Printf("Scanning file %s\n", path)
-
 	parsedLockfile, err := lockfile.Parse(path, "")
 	if err != nil {
 		return err
 	}
-	log.Printf("Scanned %s file with %d packages", parsedLockfile.ParsedAs, len(parsedLockfile.Packages))
+	log.Printf("Scanned %s file and found %d packages", path, len(parsedLockfile.Packages))
 
 	for _, pkgDetail := range parsedLockfile.Packages {
-		query.Queries = append(query.Queries, osv.MakePkgRequest(pkgDetail))
+		pkgDetailQuery := osv.MakePkgRequest(pkgDetail)
+		pkgDetailQuery.Source = "lockfile:" + path
+		query.Queries = append(query.Queries, pkgDetailQuery)
 	}
 	return nil
 }
 
 func scanSBOMFile(query *osv.BatchedQuery, path string) error {
-	log.Printf("Scanning file %s\n", path)
 	file, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 
 	for _, provider := range sbom.Providers {
+		if provider.Name() == "SPDX" &&
+			!strings.Contains(strings.ToLower(filepath.Base(path)), ".spdx") {
+			// All spdx files should have the .spdx in the filename, even if
+			// it's not the extension:  https://spdx.github.io/spdx-spec/v2.3/conformance/
+			// Skip if this isn't the case to avoid panics
+			continue
+		}
 		err := provider.GetPackages(file, func(id sbom.Identifier) error {
-			query.Queries = append(query.Queries, osv.MakePURLRequest(id.PURL))
+			purlQuery := osv.MakePURLRequest(id.PURL)
+			purlQuery.Source = "sbom:" + path
+			query.Queries = append(query.Queries, purlQuery)
 			return nil
 		})
 		if err == nil {
@@ -114,12 +127,6 @@ func scanGit(repoDir string) (*osv.Query, error) {
 	return osv.MakeCommitRequest(commit), nil
 }
 
-// Information about a docker package and it's version.
-type DockerPackageVersion struct {
-	Name    string
-	Version string
-}
-
 func scanDebianDocker(query *osv.BatchedQuery, dockerImageName string) {
 	cmd := exec.Command("docker", "run", "--rm", dockerImageName, "/usr/bin/dpkg-query", "-f", "${Package}###${Version}\\n", "-W")
 	stdout, err := cmd.StdoutPipe()
@@ -145,36 +152,22 @@ func scanDebianDocker(query *osv.BatchedQuery, dockerImageName string) {
 		if len(splitText) != 2 {
 			log.Fatalf("Unexpected output from Debian container: \n\n%s", text)
 		}
-		pkgDetails := osv.MakePkgRequest(lockfile.PackageDetails{
+		pkgDetailsQuery := osv.MakePkgRequest(lockfile.PackageDetails{
 			Name:    splitText[0],
 			Version: splitText[1],
 			// TODO(rexpan): Get and specify exact debian release version
 			Ecosystem: "Debian",
 		})
-		query.Queries = append(query.Queries, pkgDetails)
+		pkgDetailsQuery.Source = "docker:" + dockerImageName
+		query.Queries = append(query.Queries, pkgDetailsQuery)
 	}
 	log.Printf("Scanned docker image")
-}
-
-func printResults(query osv.BatchedQuery, resp *osv.BatchedResponse) {
-	for i, query := range query.Queries {
-		if len(resp.Results[i].Vulns) == 0 {
-			continue
-		}
-
-		var urls []string
-		for _, vuln := range resp.Results[i].Vulns {
-			urls = append(urls, osv.BaseVulnerabilityURL+vuln.ID)
-		}
-
-		log.Printf("%v is vulnerable to %s", query, strings.Join(urls, ", "))
-	}
 }
 
 // TODO(ochang): Machine readable output format.
 func main() {
 	var query osv.BatchedQuery
-
+	var outputJson bool
 	app := &cli.App{
 		Name:  "osv-scanner",
 		Usage: "scans various mediums for dependencies and matches it against the OSV database",
@@ -197,6 +190,15 @@ func main() {
 				Usage:     "scan sbom file on this path",
 				TakesFile: true,
 			},
+			&cli.BoolFlag{
+				Name:  "json",
+				Usage: "sets output to json (WIP)",
+			},
+			&cli.BoolFlag{
+				Name:  "skip-git",
+				Usage: "skip scanning git repositories",
+				Value: false,
+			},
 		},
 		ArgsUsage: "[directory1 directory2...]",
 		Action: func(context *cli.Context) error {
@@ -208,24 +210,25 @@ func main() {
 			}
 
 			lockfiles := context.StringSlice("lockfile")
-			for _, lockfile := range lockfiles {
-				err := scanLockfile(&query, lockfile)
+			for _, lockfileElem := range lockfiles {
+				err := scanLockfile(&query, lockfileElem)
 				if err != nil {
 					return err
 				}
 			}
 
 			sboms := context.StringSlice("sbom")
-			for _, sbom := range sboms {
-				err := scanSBOMFile(&query, sbom)
+			for _, sbomElem := range sboms {
+				err := scanSBOMFile(&query, sbomElem)
 				if err != nil {
 					return err
 				}
 			}
 
+			skipGit := context.Bool("skip-git")
 			genericDirs := context.Args().Slice()
 			for _, dir := range genericDirs {
-				err := scanDir(&query, dir)
+				err := scanDir(&query, dir, skipGit)
 				if err != nil {
 					return err
 				}
@@ -234,6 +237,8 @@ func main() {
 			if len(query.Queries) == 0 {
 				cli.ShowAppHelpAndExit(context, 1)
 			}
+
+			outputJson = context.Bool("json")
 
 			return nil
 		},
@@ -244,9 +249,21 @@ func main() {
 
 	resp, err := osv.MakeRequest(query)
 	if err != nil {
-		log.Printf("scan failed: %v\n", err)
-		return
+		log.Fatalf("Scan failed: %v", err)
 	}
 
-	printResults(query, resp)
+	hydratedResp, err := osv.Hydrate(resp)
+	if err != nil {
+		log.Fatalf("Failed to hydrate OSV response: %v", err)
+	}
+
+	if outputJson {
+		err = output.PrintJSONResults(query, hydratedResp, os.Stdout)
+	} else {
+		output.PrintTableResults(query, hydratedResp, os.Stdout)
+	}
+
+	if err != nil {
+		log.Fatalf("Failed to write output: %s", err)
+	}
 }

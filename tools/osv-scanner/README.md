@@ -19,8 +19,10 @@ auto-detected based on the input file contents.
 [CycloneDX]: https://cyclonedx.org/
 [Package URLs]: https://github.com/package-url/purl-spec
 
+### Example
+
 ```bash
-$ go run main.go --sbom=/path/to/your/sbom.json
+$ go run ./cmd/osv-scanner --sbom=/path/to/your/sbom.json
 ```
 
 ## Scanning a lockfile
@@ -38,8 +40,10 @@ A wide range of lockfiles are supported by utilizing this [lockfile package](htt
 - `pom.xml`\*         
 - `requirements.txt`\*
 
+### Example
+
 ```bash
-$ go run main.go --lockfile=/path/to/your/package-lock.json -L /path/to/another/Cargo.lock
+$ go run ./cmd/osv-scanner --lockfile=/path/to/your/package-lock.json -L /path/to/another/Cargo.lock
 ```
 
 ## Scanning a Debian based docker image packages
@@ -50,8 +54,10 @@ Currently only Debian based docker image scanning is supported.
 
 Requires `docker` to be installed and the tool to have permission calling it.
 
+### Example
+
 ```bash
-$ go run main.go --docker image_name:latest
+$ go run ./cmd/osv-scanner --docker image_name:latest
 ```
 
 ## Scanning a directory
@@ -71,5 +77,77 @@ as real git repositories.
 ### Example
 
 ```bash
-$ go run main.go /path/to/your/dir
+$ go run ./cmd/osv-scanner /path/to/your/dir
+```
+## JSON output
+By default osv-scanner outputs a human readable table. To have osv-scanner output JSON instead, pass the `--json` flag when calling osv-scanner. 
+
+### Output Format
+```
+{
+  "results": [
+    {
+      "filePath": "sbom:file/path/test.spdx.json",
+      "packages": [
+        {
+          "name": "mercurial",
+          "version": "4.8.2",
+          "ecosystem": "pypi",
+          "vulnerabilities": [
+            {
+              "id": "PYSEC-2019-188",
+              "aliases": [
+                "CVE-2019-3902"
+              ]
+            }
+          ]
+        },
+        {
+          "name": "ansi-regex",
+          "version": "3.0.0",
+          "ecosystem": "npm",
+          "vulnerabilities": [
+            {
+              "id": "GHSA-93q8-gq69-wqmw",
+              "aliases": [
+                "CVE-2021-3807"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "filePath": "lockfile:package-lock.json",
+      "packages": [
+        {
+          "name": "async",
+          "version": "2.6.3",
+          "ecosystem": "npm",
+          "vulnerabilities": [
+            {
+              "id": "GHSA-fwr7-v2mv-hh25",
+              "aliases": [
+                "CVE-2021-43138"
+              ]
+            }
+          ]
+        },
+        {
+          "name": "minimist",
+          "version": "1.2.5",
+          "ecosystem": "npm",
+          "vulnerabilities": [
+            {
+              "id": "GHSA-xvch-5gv4-984h",
+              "aliases": [
+                "CVE-2021-44906"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
 ```

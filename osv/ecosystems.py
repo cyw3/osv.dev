@@ -27,6 +27,7 @@ from .third_party.univers.gem import GemVersion
 from . import debian_version_cache
 from . import maven
 from . import nuget
+from . import packagist_version
 from . import semver_index
 from .cache import Cache
 from .cache import cached
@@ -35,6 +36,7 @@ from .request_helper import RequestError, RequestHelper
 _DEPS_DEV_API = (
     'https://api.deps.dev/insights/v1alpha/systems/{ecosystem}/packages/'
     '{package}/versions')
+TIMEOUT = 30  # Timeout for HTTP(S) requests
 use_deps_dev = False
 deps_dev_api_key = ''
 
@@ -53,14 +55,19 @@ class DepsDevMixin:
       'PyPI': 'PYPI',
   }
 
-  def _deps_dev_enumerate(self, package, introduced, fixed, limits=None):
+  def _deps_dev_enumerate(self,
+                          package,
+                          introduced,
+                          fixed=None,
+                          last_affected=None,
+                          limits=None):
     """Use deps.dev to get list of versions."""
     ecosystem = self._DEPS_DEV_ECOSYSTEM_MAP[self.name]
     url = _DEPS_DEV_API.format(ecosystem=ecosystem, package=package)
     response = requests.get(
         url, headers={
             'X-DepsDev-APIKey': deps_dev_api_key,
-        })
+        }, timeout=TIMEOUT)
 
     if response.status_code == 404:
       raise EnumerateError(f'Package {package} not found')
@@ -72,7 +79,8 @@ class DepsDevMixin:
     response = response.json()
     versions = [v['version'] for v in response['versions']]
     self.sort_versions(versions)
-    return self._get_affected_versions(versions, introduced, fixed, limits)
+    return self._get_affected_versions(versions, introduced, fixed,
+                                       last_affected, limits)
 
 
 class Ecosystem:
@@ -112,18 +120,25 @@ class Ecosystem:
     """Sort versions."""
     versions.sort(key=self.sort_key)
 
-  def enumerate_versions(self, package, introduced, fixed, limits=None):
+  def enumerate_versions(self,
+                         package,
+                         introduced,
+                         fixed=None,
+                         last_affected=None,
+                         limits=None):
     """Enumerate versions."""
     raise NotImplementedError
 
-  def _get_affected_versions(self, versions, introduced, fixed, limits):
+  def _get_affected_versions(self, versions, introduced, fixed, last_affected,
+                             limits):
     """Get affected versions.
 
     Args:
       versions: a list of version strings.
-      introduced: a list of version strings.
-      fixed: a list of version strings.
-      limits: a list of version strings.
+      introduced: a version string.
+      fixed: a version string.
+      last_affected: a version string.
+      limits: a version string.
 
     Returns:
       A list of affected version strings.
@@ -142,6 +157,9 @@ class Ecosystem:
     if fixed:
       fixed = self.sort_key(fixed)
       end_idx = bisect.bisect_left(parsed_versions, fixed)
+    elif last_affected:
+      last_affected = self.sort_key(last_affected)
+      end_idx = bisect.bisect_right(parsed_versions, last_affected)
     else:
       end_idx = len(versions)
 
@@ -160,7 +178,12 @@ class SemverEcosystem(Ecosystem):
     """Sort key."""
     return semver_index.parse(version)
 
-  def enumerate_versions(self, package, introduced, fixed, limits=None):
+  def enumerate_versions(self,
+                         package,
+                         introduced,
+                         fixed=None,
+                         last_affected=None,
+                         limits=None):
     """Enumerate versions (no-op)."""
     del package
     del introduced
@@ -184,6 +207,7 @@ class SemverEcosystem(Ecosystem):
 Crates = SemverEcosystem
 Go = SemverEcosystem
 NPM = SemverEcosystem
+Hex = SemverEcosystem
 
 
 class PyPI(Ecosystem):
@@ -195,9 +219,15 @@ class PyPI(Ecosystem):
     """Sort key."""
     return packaging.version.parse(version)
 
-  def enumerate_versions(self, package, introduced, fixed, limits=None):
+  def enumerate_versions(self,
+                         package,
+                         introduced,
+                         fixed=None,
+                         last_affected=None,
+                         limits=None):
     """Enumerate versions."""
-    response = requests.get(self._API_PACKAGE_URL.format(package=package))
+    response = requests.get(
+        self._API_PACKAGE_URL.format(package=package), timeout=TIMEOUT)
 
     if response.status_code == 404:
       raise EnumerateError(f'Package {package} not found')
@@ -209,7 +239,8 @@ class PyPI(Ecosystem):
     versions = list(response['releases'].keys())
     self.sort_versions(versions)
 
-    return self._get_affected_versions(versions, introduced, fixed, limits)
+    return self._get_affected_versions(versions, introduced, fixed,
+                                       last_affected, limits)
 
 
 class Maven(Ecosystem, DepsDevMixin):
@@ -254,7 +285,12 @@ class Maven(Ecosystem, DepsDevMixin):
 
     return versions
 
-  def enumerate_versions(self, package, introduced, fixed, limits=None):
+  def enumerate_versions(self,
+                         package,
+                         introduced,
+                         fixed=None,
+                         last_affected=None,
+                         limits=None):
     """Enumerate versions."""
     if use_deps_dev:
       return self._deps_dev_enumerate(package, introduced, fixed, limits=limits)
@@ -265,7 +301,8 @@ class Maven(Ecosystem, DepsDevMixin):
 
     versions = get_versions(package)
     self.sort_versions(versions)
-    return self._get_affected_versions(versions, introduced, fixed, limits)
+    return self._get_affected_versions(versions, introduced, fixed,
+                                       last_affected, limits)
 
 
 class RubyGems(Ecosystem):
@@ -277,9 +314,15 @@ class RubyGems(Ecosystem):
     """Sort key."""
     return GemVersion(version)
 
-  def enumerate_versions(self, package, introduced, fixed, limits=None):
+  def enumerate_versions(self,
+                         package,
+                         introduced,
+                         fixed=None,
+                         last_affected=None,
+                         limits=None):
     """Enumerate versions."""
-    response = requests.get(self._API_PACKAGE_URL.format(package=package))
+    response = requests.get(
+        self._API_PACKAGE_URL.format(package=package), timeout=TIMEOUT)
     if response.status_code == 404:
       raise EnumerateError(f'Package {package} not found')
     if response.status_code != 200:
@@ -291,7 +334,8 @@ class RubyGems(Ecosystem):
     versions = [entry['number'] for entry in response]
 
     self.sort_versions(versions)
-    return self._get_affected_versions(versions, introduced, fixed, limits)
+    return self._get_affected_versions(versions, introduced, fixed,
+                                       last_affected, limits)
 
 
 class NuGet(Ecosystem):
@@ -304,10 +348,15 @@ class NuGet(Ecosystem):
     """Sort key."""
     return nuget.Version.from_string(version)
 
-  def enumerate_versions(self, package, introduced, fixed, limits=None):
+  def enumerate_versions(self,
+                         package,
+                         introduced,
+                         fixed=None,
+                         last_affected=None,
+                         limits=None):
     """Enumerate versions."""
     url = self._API_PACKAGE_URL.format(package=package.lower())
-    response = requests.get(url)
+    response = requests.get(url, timeout=TIMEOUT)
     if response.status_code == 404:
       raise EnumerateError(f'Package {package} not found')
     if response.status_code != 200:
@@ -321,7 +370,7 @@ class NuGet(Ecosystem):
       if 'items' in page:
         items = page['items']
       else:
-        items_response = requests.get(page['@id'])
+        items_response = requests.get(page['@id'], timeout=TIMEOUT)
         if items_response.status_code != 200:
           raise RuntimeError(
               f'Failed to get NuGet versions page for {package} with: '
@@ -333,27 +382,32 @@ class NuGet(Ecosystem):
         versions.append(item['catalogEntry']['version'])
 
     self.sort_versions(versions)
-    return self._get_affected_versions(versions, introduced, fixed, limits)
+    return self._get_affected_versions(versions, introduced, fixed,
+                                       last_affected, limits)
 
 
 class Debian(Ecosystem):
   """Debian ecosystem"""
 
   _API_PACKAGE_URL = 'https://snapshot.debian.org/mr/package/{package}/'
-  _END_OF_LIFE_VER = '<end-of-life>'
   debian_release_ver: str
 
   def __init__(self, debian_release_ver: str):
     self.debian_release_ver = debian_release_ver
 
   def sort_key(self, version):
-    if version == self._END_OF_LIFE_VER:
-      # End of life advisory means all versions can be affected
-      return DebianVersion(999999)
-
+    if not DebianVersion.is_valid(version):
+      # If debian version is not valid, it is most likely an invalid fixed
+      # version then sort it to the last/largest element
+      return DebianVersion(999999, 999999)
     return DebianVersion.from_string(version)
 
-  def enumerate_versions(self, package, introduced, fixed, limits=None):
+  def enumerate_versions(self,
+                         package,
+                         introduced,
+                         fixed=None,
+                         last_affected=None,
+                         limits=None):
     url = self._API_PACKAGE_URL.format(package=package.lower())
     request_helper = RequestHelper(shared_cache)
     try:
@@ -377,7 +431,7 @@ class Debian(Ecosystem):
 
     versions = [v for v in raw_versions if version_is_valid(v)]
     # Sort to ensure it is in the correct order
-    versions.sort(key=self.sort_key)
+    self.sort_versions(versions)
     # The only versions with +deb
     versions = [
         x for x in versions
@@ -389,19 +443,57 @@ class Debian(Ecosystem):
       introduced = debian_version_cache.get_first_package_version(
           package, self.debian_release_ver)
 
-    if fixed == self._END_OF_LIFE_VER:
-      # Special case for eol, we do not enumerate
+    if fixed is not None and not DebianVersion.is_valid(fixed):
+      logging.warning(
+          'Package %s has invalid fixed version: %s. In debian release %s',
+          package, fixed, self.debian_release_ver)
       return []
 
-    return self._get_affected_versions(versions, introduced, fixed, limits)
+    return self._get_affected_versions(versions, introduced, fixed,
+                                       last_affected, limits)
+
+
+class Packagist(Ecosystem):
+  """Packagist ecosystem"""
+
+  _API_PACKAGE_URL = 'https://repo.packagist.org/p2/{package}.json'
+
+  def sort_key(self, version):
+    return packagist_version.PackagistVersion(version)
+
+  def enumerate_versions(self,
+                         package,
+                         introduced,
+                         fixed=None,
+                         last_affected=None,
+                         limits=None):
+    url = self._API_PACKAGE_URL.format(package=package.lower())
+    request_helper = RequestHelper(shared_cache)
+    try:
+      text_response = request_helper.get(url)
+    except RequestError as ex:
+      if ex.response.status_code == 404:
+        raise EnumerateError(f'Package {package} not found') from ex
+      raise RuntimeError('Failed to get Packagist versions for '
+                         f'{package} with: {ex.response.text}') from ex
+
+    response = json.loads(text_response)
+    versions: list[str] = [x['version'] for x in response['packages'][package]]
+    self.sort_versions(versions)
+    # TODO(rexpan): Potentially filter out branch versions like dev-master
+
+    return self._get_affected_versions(versions, introduced, fixed,
+                                       last_affected, limits)
 
 
 _ecosystems = {
     'crates.io': Crates(),
     'Go': Go(),
+    'Hex': Hex(),
     'Maven': Maven(),
     'npm': NPM(),
     'NuGet': NuGet(),
+    'Packagist': Packagist(),
     'PyPI': PyPI(),
     'RubyGems': RubyGems(),
 }
@@ -410,6 +502,7 @@ SEMVER_ECOSYSTEMS = {
     'crates.io',
     'Go',
     'npm',
+    'Hex',
 }
 
 
